@@ -1,13 +1,13 @@
 # 拼豆图生成器开发文档
 
-> 文档版本：1.1
-> 对应代码：当前 `app.py` / `core.py` 实现  
-> 更新日期：2026-09-06  
+> 文档版本：1.5
+> 对应代码：当前 `app.py` / `brand_palettes.py` / `core.py` / `excel_export.py` 实现
+> 更新日期：2026-09-07
 > 适用读者：开发、测试、维护和二次开发人员
 
 ## 1. 系统概览
 
-本项目是单进程 Python 网页应用。Streamlit 提供上传、参数控件、结果预览和下载；Pillow 与 NumPy 负责图片预处理、量化及像素映射；ReportLab 负责生成 A4 分页 PDF。所有生成结果保存在当前 Streamlit 会话内存中，不写入数据库，也不依赖外部 API。
+本项目是单进程 Python 网页应用。Streamlit 提供上传、参数控件、结果预览和下载；Pillow 与 NumPy 负责图片预处理、量化及像素映射；ReportLab 负责生成 A4 分页 PDF。所有生成结果保存在当前 Streamlit 会话内存中，不写入数据库。图片转换和导出不依赖外部 API；语言自动识别可由浏览器查询 Country.is，查询失败不影响本地工作流。
 
 ```mermaid
 flowchart TD
@@ -60,12 +60,63 @@ python test_app.py
 
 Excel 测试覆盖非方形逐像素映射、颜色、前导零、公式注入防护、隐藏色号、跨品牌重复色号、300×300 最大网格、无效输入及 ZIP 字节一致性。
 
+### 2.4 状态与分页完善（v1.2）
+
+生成设置通过稳定 JSON 序列化计算 SHA-256；指纹包含源图片内容和文件名、色库内容、品牌筛选、构图、色彩与导出参数。参数变化后立即清除旧结果；每次生成前也清除旧结果，防止失败时保留旧下载。PDF 余页沿用完整分页的格子尺寸，粗线按全局行列坐标独立绘制。侧栏显示预计网格页数，超过 36 页时提示。
+
+开发依赖使用 `requirements-dev.txt` 安装，其中 `pypdf` 仅用于解析 PDF 内容并验证页数、坐标覆盖和格子尺寸，不属于运行依赖。
+
+### 2.5 清晰度与预览完善（v1.3）
+
+v1.3 增加 `prepare_image(..., line_strength=0.0, sharpness=0.0)` 两个尾部可选参数，保持旧调用兼容。UI 默认 0.65/0.25，对比度默认 1.0；生成设置记录两项参数及版本 1.3.0。
+
+细线保留在目标网格 4 倍尺寸（最多 1200×1200）上处理亮度：先用 5×5 最大值/最小值滤波做闭运算，以闭运算结果与原亮度之差检测窄暗线。忽略 12 以下的弱差异，按每颗覆盖的 4×4 样本聚合线条颜色与覆盖率，仅向更暗的颜色混合，混合系数上限为 `0.85 * line_strength`。随后可选目标尺寸的轻度 UnsharpMask（半径 0.6，百分比为强度乘 160，阈值 3）。所有导出仍从增强后匹配得到的同一个 `indices` 生成。
+
+`pixel_view()` 通过本地 PNG 的 base64 和 `st.html` 显示处理前后对比预览。对比预览使用等高窗口和共用缩放控件，默认以 `object-fit: contain` 完整显示；选择每颗像素大小后，两图宽度均为 `columns * comparison_zoom`，在窗口内双向滚动。原画保持原始比例，拼豆效果使用清晰像素渲染。彩色网格图由 `grid_viewer.py` 和本地 `frontend/grid_viewer.js`、`grid_viewer.css` 提供，按页面宽度显示，高度随图片比例展开。常驻“放大查看”按钮与图纸点击都可打开原生 `dialog` 大图窗口；滚轮、加减按钮缩放至最高 400%，鼠标或单指拖动平移，支持原始大小、适应窗口及 Esc 关闭。普通预览和大图都不设内部滚动条，平移限制在图纸边界内，四角均可到达。缩放与平移完全在浏览器进行，不触发 Python 重跑、不加入生成指纹，也不改变下载；直接使用已生成的同一份 PNG。组件使用 Shadow DOM 隔离样式，卸载时清理对话框、事件与尺寸观察器，翻译通过 `textContent` 设置。
+
+限制：细线保留也可能增强噪点，无法恢复采样前已丢失的结构；极细浅线仍可能被量化合并。照片建议关闭或降低细线强度，保留可调选项便于按图选择。
+
+### 2.6 离线品牌色卡（v1.4）
+
+`brand_palettes.py` 提供 `BRAND_PALETTES` 目录、`load_brand_palette()` 和不可变的 `BrandPalette`。数据从相对于模块的 `data/brand_palettes/` 读取，无运行时网络请求。内置五个品牌、六套版本：MARD 221/291、COCO 291、漫漫 278、盼盼 285 个有效色号、咪小窝 286 个有效色号。MARD 两版共用色号的 RGB 一致。
+
+加载器验证色卡标识、记录数量、唯一文本色号、RGB 范围及 HEX 一致性；排除 `unidentified`、`UNKNOWN-*` 和 `-` 占位色号。`BrandPalette.select(groups)` 按上游分组返回 `BeadColor`，保留原始色号及品牌，不补造色名、材质或尺寸分类。缺失或无效数据显示错误并阻止生成。
+
+`app.py` 通过品牌、版本及分组控件获取色库，仍调用 `map_to_palette()` 从原画重新匹配，后续所有渲染和导出继续共享 `indices`。实际数据文件的 SHA-256、品牌、版本、来源、分组随设置参与指纹，变化后清除旧结果。空分组禁用生成。当前生成设置版本为 1.4.0。
+
+`make_bundle()` 增加可选关键字参数 `palette_notice=None`；品牌模式写入 `palette_source.txt`，包含数据来源、校验值和原始 MIT 许可。JSON 快照、固定上游提交及维护约定见 `data/brand_palettes/README.md`；发布时必须一并携带数据与许可文件。
+
+品牌回归测试覆盖六套色卡的完整生成与导出、分组限制、切换失效、空选择、缺失及损坏数据、实际品牌色号、数量总和、Excel 文本单元格和 ZIP 字节一致性。
+
+### 2.7 多语言增量（v1.5）
+
+`i18n.py` 使用 `Translator(language)` 读取 `locales/` 中的四套 JSON。中文源消息作为稳定键，变量使用具名占位符；`LocalizedError` 继承 `ValueError`，保留消息模板及参数，在 UI 边界翻译，导入文本不作为翻译键。
+
+`language_ui.language_controls()` 挂载 Streamlit v2 组件。`frontend/language.js` 从访问者浏览器查询 IP 地区、保存选择和地区缓存；Python 只接收地区代码、语言偏好和浏览器语言，不接收完整 IP。显式 `lang` 参数优先于保存的偏好，手动选择优先于自动规则，IP 失败回退浏览器语言。请求和缓存策略详见 `docs/I18N.md`。
+
+翻译会改变选项显示文字；`translated_selection()` 将规范值保存在独立会话字典，用带语言后缀的控件键重建下拉、多选和单选项，避免旧显示值残留。数字、勾选项及上传控件使用固定键。显示标签不参与构图、品牌匹配或设置指纹。
+
+生成结果新增 `indices`、原始 `source_palette`、`generation_settings` 和品牌来源对象。`localized_exports.with_localized_exports()` 仅从这些结果更新使用量文字、CSV、PDF、XLSX 与 ZIP，不调用 `prepare_image()` 或 `map_to_palette()`。新输出完整生成后一次替换会话结果；失败时清除下载。`export_language` 写入 ZIP 设置，但不参与图片设置指纹。程序版本为 1.5.0。
+
+`test_i18n.py` 的语言规则、完整性和占位符测试由 `test_core.py` 一并执行；四种语言来回切换、图片与参数保留、索引矩阵不变、导出一致性的测试由 `test_app.py` 一并执行。
+
 ## 3. 目录结构
 
 ```text
 bead_maker/
 ├── app.py                    # Streamlit 页面与交互编排
 ├── core.py                   # 图像、色库、匹配、统计和导出核心
+├── brand_palettes.py         # 离线品牌色卡加载、校验与分组筛选
+├── i18n.py                   # 翻译、语言回退和可翻译错误
+├── language_ui.py            # 语言选择及稳定的翻译控件
+├── localized_exports.py      # 复用索引矩阵更新导出语言
+├── grid_viewer.py            # 无滚动条的网格图预览与放大入口
+├── frontend/language.js      # 浏览器 IP 地区查询和语言记忆
+├── frontend/grid_viewer.*    # 大图窗口、缩放与拖动的 JS/CSS
+├── locales/                  # zh-CN、zh-TW、en、ja 本地翻译
+├── excel_export.py           # 一颗拼豆一单元格的 XLSX 导出
+├── data/brand_palettes/      # 品牌 JSON 快照、来源说明与 MIT 许可
+├── AGENTS.md                 # 项目约定和必需验证
 ├── requirements.txt          # 运行依赖
 ├── requirements-dev.txt      # 调试依赖（含运行依赖）
 ├── README.md                 # 用户安装与使用说明
@@ -74,9 +125,15 @@ bead_maker/
 ├── debug_windows.bat         # Windows debugpy 启动脚本
 ├── start_macos_linux.sh      # macOS/Linux 启动脚本
 ├── test_core.py              # 核心烟雾测试
+├── test_excel.py             # Excel 映射、文本与打包回归
+├── test_app.py               # 上传、生成、下载与结果失效回归
+├── test_i18n.py              # 翻译完整性、语言规则和切换回归
+├── test_language_frontend.mjs # IP 查询、缓存、超时与手动优先回归
 └── docs/
     ├── PRD.md                # 产品需求文档
-    └── DEVELOPMENT.md        # 本开发文档
+    ├── DEVELOPMENT.md        # 本开发文档
+    ├── I18N.md               # 语言使用、网络边界与维护
+    └── QUICKSTART.*.md       # 英语、繁体中文和日语入门
 ```
 
 ## 4. 快速开始
@@ -122,8 +179,10 @@ sequenceDiagram
     UI->>Core: 构建/导入色库
     UI->>Core: map_to_palette
     Core-->>UI: 色号索引矩阵
-    UI->>Core: 预览、网格、统计、PDF、ZIP
-    Core-->>Out: PNG/CSV/PDF/ZIP bytes
+    UI->>Core: 预览、网格、统计、PDF
+    UI->>UI: excel_export.make_xlsx
+    UI->>Core: 打包 ZIP（含相同 XLSX 字节）
+    Core-->>Out: PNG/CSV/XLSX/PDF/ZIP bytes
     Out-->>U: 浏览器下载
 ```
 
@@ -132,9 +191,9 @@ sequenceDiagram
 1. `st.file_uploader` 将上传文件读为 `bytes`。
 2. `load_image()` 解码第一帧、检查像素数并修正 EXIF 方向。
 3. `prepare_image()` 合成透明背景、调整对比度/饱和度，再按目标网格缩放。
-4. UI 根据模式调用 `builtin_palette()`、`extract_palette()` 或 `parse_palette_csv()`。
+4. UI 根据模式调用 `builtin_palette()`、`load_brand_palette().select()`、`extract_palette()` 或 `parse_palette_csv()`。
 5. `map_to_palette()` 将每个目标像素映射为色库索引，形成 `rows × columns` 的 `int16` 数组。
-6. 该索引矩阵作为单一事实来源，分别生成预览、带格图、统计、PDF 和 ZIP。
+6. 该索引矩阵作为单一事实来源，分别生成预览、带格图、统计、PDF 和 XLSX，然后打包 ZIP。
 7. 二进制结果放入 `st.session_state["result"]`，供页面切换和下载按钮复用。
 
 ## 6. 数据模型
@@ -169,8 +228,8 @@ class BeadColor:
 
 | 键 | 内容 | 生命周期 |
 | --- | --- | --- |
-| `source_id` | 上传文件的 SHA-256 | 更换原画时更新，用于清除旧结果 |
-| `result` | 预览、网格、CSV、PDF、ZIP、统计和尺寸 | 当前浏览器会话；重新启动进程后丢失 |
+| `source_id` | 上传文件的 SHA-256 | 更换原画时更新，移除原画时清除 |
+| `result` | 预览、网格、CSV、PDF、XLSX、ZIP、统计、尺寸和 `settings_id` | 当前会话；输入变化或生成失败时清除 |
 
 ## 7. 模块与函数
 
@@ -180,7 +239,7 @@ class BeadColor:
 
 | 区域/函数 | 职责 |
 | --- | --- |
-| 页面配置与 CSS | 设置宽屏布局、中文标题、背景、表格和按钮样式 |
+| 页面配置与 CSS | 设置宽屏布局、当前语言的标题、背景、表格和按钮样式 |
 | `parse_hex()` | 将颜色选择器的六位 HEX 转为 RGB；无效值回退为白色 |
 | `legend_html()` | 对统计数据做 HTML 转义后，渲染带色块的用量表 |
 | 上传处理 | 60 MB 文件限制、图片解码、源文件哈希和旧结果清理 |
@@ -227,7 +286,7 @@ class BeadColor:
 
 ### 8.2 对比度与饱和度
 
-先调整对比度，再调整饱和度。UI 默认值均为 1.05，目的是在低分辨率量化前略微增强区分度。饱和度 0.0 会得到灰度效果。
+先调整对比度，再调整饱和度。UI 默认值分别为 1.0 和 1.05；随后构图缩小并按设置保留细线、轻度锐化。饱和度 0.0 会得到灰度效果。
 
 ### 8.3 构图模式
 
@@ -245,7 +304,7 @@ class BeadColor:
 
 `_GENERIC_64` 定义 64 个屏幕 RGB 参考色，色号按当前列表位置生成 `G01` 至 `G64`。32 色模式通过固定索引提取跨越中性色、暖色、肤色/棕色、紫色、蓝色、青色和绿色的平衡子集，再重新编号为 `G01` 至 `G32`。
 
-内置颜色不是任何实体品牌的官方测量值。若需要精确品牌映射，应导入品牌色库。
+通用颜色不是任何实体品牌的官方测量值。需要品牌色号时可使用内置品牌色卡；追求实物校准时，应导入自己的实测色库。
 
 ### 9.2 自动取色
 
@@ -275,7 +334,7 @@ UI 允许 2-64 色；核心函数本身将参数限制在 2-96 色。
 - RGB 值必须是 0-255 的整数。
 - 忽略完全空白的行。
 - 错误信息包含 CSV 行号。
-- 解析完成后要求至少两个有效颜色。
+- 解析完成后要求至少一个有效颜色，上限为 `MAX_PALETTE_COLORS = 512`；保留前导零和跨品牌重复色号。
 
 ## 10. 颜色匹配算法
 
@@ -319,7 +378,7 @@ d² = (L1-L2)² + (a1-a2)² + (b1-b2)²
 - 输出索引内存：`O(N)`。
 - 单个距离分块的主要临时内存：`O(4096P)`。
 
-最大 UI 网格为 90,000 个像素，内置色库最多 64 色，适合桌面端同步处理。
+最大 UI 网格为 90,000 个像素，内置色库最多 64 色，自定义色库最多 512 色。匹配接受单色色库，拒绝空色库及超限色库。
 
 ## 11. 网格与统计渲染
 
@@ -349,11 +408,13 @@ actual_cell = min(requested_cell, max(14, 5200 // max(rows, columns)))
 成品高度（cm） = rows × bead_size_mm / 10
 ```
 
+界面中的单颗直径默认值为 2.6 mm，可手动调整。网页尺寸、PDF 摘要和 ZIP 设置均使用本次选择的同一个 `bead_size_mm`；默认 100×100 颗对应约 26×26 cm。
+
 该值是假设拼豆中心距等于用户填写的直径，不包含熨烫收缩、边框或拼接间隙。
 
 ## 12. PDF 分页
 
-`make_pdf()` 使用 A4 纵向页面和 ReportLab Helvetica 字体。
+`make_pdf()` 使用 A4 纵向页面，按语言选择 ReportLab Helvetica 或 Unicode CID 字体。
 
 1. 首先生成汇总与颜色用量页。
 2. 依据用户选择的 `(tile_columns, tile_rows)` 将网格切片。
@@ -363,9 +424,9 @@ actual_cell = min(requested_cell, max(14, 5200 // max(rows, columns)))
 6. 单格尺寸取可用页面宽高的较小值。
 7. 单格至少 8 pt 时绘制色号，PDF 色号最多 6 个字符。
 
-`bead_size_mm` 仅写入预计成品尺寸，不控制 PDF 单元格的实际打印尺寸，因此 PDF 是参考网格而不是 1:1 实物模板。最后一个水平或垂直分页按剩余行列重新计算单格尺寸，可能与完整分页的格子大小不同。
+`bead_size_mm` 仅写入预计成品尺寸，不控制 PDF 单元格的实际打印尺寸，因此 PDF 是参考网格而不是 1:1 实物模板。单格尺寸按 `min(columns, tile_columns)` 与 `min(rows, tile_rows)` 在分页前计算一次，余页沿用同一尺寸。先绘制色块与色号，再按全局坐标独立绘制横纵网格线；每五格和分页外边框加粗。
 
-注意：为保证默认环境可移植，PDF 未嵌入中文字体。中文颜色名称在色表中会回退为 `Colour`，但色块、色号、HEX、数量和占比仍然保留。网页和 CSV 中的中文不受影响。
+PDF 的 `language` 关键字参数控制标题、摘要、表头和分页说明，旧核心调用默认英语。简体中文、繁体中文、日语分别使用 ReportLab 的 `STSong-Light`、`MSung-Light`、`HeiseiKakuGo-W5` Unicode CID 字体，英语使用 Helvetica。`_register_pdf_cjk_font()` 为繁体字体显式选择 `UniCNS-UCS2-H`，纠正 ReportLab 默认 GB 编码与 CNS 字体不匹配的问题。非拉丁颜色名称使用 CJK 字体并按列宽缩小，不再删去中文名称。字体不联网下载、不随文件嵌入，实际显示依赖阅读器的 CJK 字体支持；坐标和格内色号仍按原有网格规则渲染。
 
 ## 13. 导出文件
 
@@ -388,11 +449,15 @@ pattern_grid.png
 pixel_preview.png
 bead_usage.csv
 printable_pattern.pdf
+bead_pattern.xlsx
 palette_used.csv
 settings.json
+palette_source.txt（品牌模式）
 ```
 
-`settings.json` 使用 UTF-8 和缩进格式，保留网格、构图、拼豆直径、色库模式、所选品牌、色号开关、对比度、饱和度、背景色及 PDF 分页参数。
+`settings.json` 使用 UTF-8 和缩进格式，保留网格、比例开关、构图、拼豆直径、色库模式、所选品牌、色号开关、对比度、饱和度、背景色及 PDF 分页参数。另含 `app_version`、`auto_count`、`png_cell_size`、`source_name`、`source_sha256` 和 `palette_sha256`；PNG 单格尺寸是请求值，实际值仍受渲染上限约束。XLSX 由应用传入，旧调用未传 `xlsx_bytes` 时不加入该文件。
+
+品牌模式还记录 `brand_palette` 来源信息和 `palette_groups` 所选分组。`palette_source.txt` 由 `palette_notice` 提供，包含所选数据的来源、日期、校验值和许可；其余模式不写入该文件。
 
 ## 14. 错误处理
 
@@ -405,7 +470,8 @@ settings.json
 | CSV 编码不支持 | `_decode_csv()` | 提示另存为 UTF-8 |
 | CSV 缺少颜色字段 | `parse_palette_csv()` | 提示需要 HEX 或 RGB 三列 |
 | CSV 某行颜色无效 | `parse_palette_csv()` | 返回具体行号和原因 |
-| 筛选后颜色不足 | `app.py` / `map_to_palette()` | 阻止生成并提示至少两个颜色 |
+| 筛选后无颜色、色库为空或超过 512 色 | `app.py` / `map_to_palette()` | 阻止生成并显示原因 |
+| PDF 分页行列数不是正整数 | `make_pdf()` | 抛出 `LocalizedError`，界面按当前语言显示 |
 | 生成阶段其他异常 | `app.py` | 捕获并在页面显示“生成失败” |
 
 ## 15. 安全与隐私
@@ -417,7 +483,7 @@ settings.json
 - 文件名由程序固定，不使用用户上传文件名拼接输出路径。
 - 60 MB 文件上限、8000 万像素上限和 PNG 尺寸约束可降低资源耗尽风险。
 
-这些措施不是完整的服务端防护：`uploaded.getvalue()` 会先把上传内容读入内存，8000 万像素 RGB/RGBA 图像在解码和转换期间仍可能产生数百 MB 甚至超过 1 GB 的峰值。自定义色库也没有条目上限。若作为多人服务部署，应使用更严格的反向代理请求限制、进程内存限制、并发控制和任务超时。
+应用先检查 `uploaded.size` 再读取图片字节，自定义色库最多 512 色。但上传内容本身已经由 Streamlit 接收，8000 万像素 RGB/RGBA 图像在解码和转换期间仍可能产生很高峰值。若作为多人服务部署，应使用更严格的反向代理请求限制、进程内存限制、并发控制和任务超时。
 
 如果部署到远程服务器，“本地处理”的隐私结论将不再成立：图片会被上传到服务器进程。公开部署前应补充 HTTPS、访问控制、请求体限制、会话隔离、临时数据策略和安全审计。
 
@@ -428,7 +494,10 @@ settings.json
 执行：
 
 ```bash
+python -m pip install -r requirements-dev.txt
 python test_core.py
+python -m unittest test_excel -v
+python test_app.py
 ```
 
 `test_core.py` 使用合成红/蓝图像验证：
@@ -438,6 +507,10 @@ python test_core.py
 - 网格导出以 PNG 签名开头。
 - PDF 导出以 `%PDF` 开头。
 - 中文 CSV 表头和 HEX 色值可以解析为指定色号。
+- 单色色库、512 色边界与超限拒绝。
+- PDF 余页格子尺寸一致、网格坐标完整覆盖和非法分页参数拒绝。
+
+`test_app.py` 覆盖通用色库、品牌色卡、自定义、自动取色流程，验证生成设置记录、普通重跑保留结果、参数变化/同名色库替换/损坏图片/导出失败清除结果。`test_excel.py` 覆盖一像素一单元格、文本安全、300×300 网格和 ZIP/XLSX 字节一致性。上述命令还运行 `test_i18n.py` 的地区映射、翻译完整性、PDF 字符映射和四语切换回归；切换后索引、上传内容和参数保持不变，导出语言正确且不重新转换图片。浏览器组件的网络失败、超时、缓存、手动优先和竞态测试见 [I18N.md](I18N.md)。
 
 开发时还可使用 Streamlit AppTest 验证初始页面渲染：
 
@@ -473,7 +546,7 @@ assert at.title[0].value == "拼豆图生成器"
 ### 17.2 类型和错误
 
 - 保持类型注解。
-- 可预期的用户输入错误使用 `ValueError` 和可直接展示的中文信息。
+- 可预期的用户输入错误使用 `LocalizedError`（继承 `ValueError`），保存翻译模板与独立数据参数；四份语言文件同步更新。
 - 不在核心层依赖 `st.error()`；由 UI 层统一呈现异常。
 - 新增色库字段时，必须同步更新导入、统计、CSV 和 ZIP 数据字典。
 
@@ -520,22 +593,18 @@ def map_to_palette(image, palette, metric="cie76"):
 
 ## 19. 已知限制与技术债
 
-- 内置色库为通用屏幕参考色，没有实体品牌的官方校准数据。
+- 内置通用色库与公开品牌色卡均为屏幕参考值，没有实体品牌的官方校准数据。
 - 颜色差异使用 CIE76，未实现更符合复杂感知差异的 CIEDE2000。
-- 纯色或颜色种类过少的图片在自动取色后可能只产生一个颜色，而 `map_to_palette()` 要求至少两个颜色，当前会生成失败。
-- 未提供抖动、边缘感知、自动抠图或手工修图。
+- 未提供抖动、自动抠图或手工修图；已提供局部暗线保留与轻度锐化，但不识别人脸或语义轮廓。
 - PNG/PDF 格内长色号会截断；完整值只在统计表中保留。
-- PDF 未嵌入中文字体，中文颜色名称不能完整显示。
-- 设置改变后页面会保留上一次结果，直到用户再次点击生成；只有更换原画会自动清除结果。
-- 同一原画重新生成失败时，旧 `result` 不会清除，页面可能同时显示错误和上一次可下载结果。
+- PDF 使用 Unicode CID 字体，未嵌入完整字体；阅读器需支持相应 CJK 字体。特殊字符覆盖仍受字体限制。
+- 设置改变后需重新点击生成，旧结果会清除；当前不自动计算。
 - 所有导出同时驻留在会话内存，大型图纸会产生明显内存峰值。
-- `settings.json` 当前未记录 PNG 单格尺寸、自动取色数量、源文件名及源文件校验值。
-- 自定义色库没有条目数上限；匹配耗时随色库大小线性增加。索引矩阵为 `int16`，色库超过 32,768 项时下标可能溢出，因此在支持不可信 CSV 前必须增加硬上限。
-- 应用在检查 60 MB 阈值前已调用 `uploaded.getvalue()`；该阈值阻止后续解码，但不能避免上传字节本身占用内存。
+- 自定义色库限制为 512 色，但仍未诊断重复色号和重复 RGB。
+- 60 MB 阈值不能避免 Streamlit 已接收的上传字节占用内存。
 - 8000 万像素阈值仍允许很高的解码与 RGBA 合成峰值，不适合作为共享服务器的默认安全值。
 - 300×300 网格在 25×35 分页下会产生 108 个网格页，另加汇总/色表页；当前同步生成可能耗时且占用大量内存。
-- PDF 最后一个不满页的分块会按剩余行列放大单格，页与页之间比例可能不一致；当前 PDF 也不是按拼豆直径 1:1 打印。
-- PDF 的“每 5 格粗线”通过对满足模数条件的单元格矩形整体加粗实现，部分边界会比理想的单独分隔线更重。
+- PDF 不按拼豆直径 1:1 打印。
 - PDF 图例没有品牌列；多个品牌使用相同色号时可能产生歧义。
 - 结果字典同时保存独立 PNG、CSV、PDF，以及再次包含这些内容的 ZIP，造成重复驻留。
 - 依赖使用版本范围而非完整锁文件和哈希，未来安装结果可能随上游版本变化。
@@ -543,17 +612,19 @@ def map_to_palette(image, palette, metric="cie76"):
 - 默认启动方式不提供应用级认证或 TLS，不应直接暴露到公网。
 - HEIC/HEIF 取决于可选解码器是否成功安装。
 - GIF 只处理第一帧。
-- 测试主要覆盖核心烟雾路径，尚缺少系统化单元测试与端到端交互测试。
-- 当前 `test_core.py` 使用普通 `assert` 和 `main()`，不是 pytest/unittest 可收集用例；使用 `python -O` 会跳过断言。
-- `app.py` 中存在未使用的 `io` 导入，`core.py` 中存在未使用的 `landscape` 导入，可在后续代码清理中移除。
+- 核心、Excel 和端到端回归覆盖主要生成路径及四语切换；跨平台阅读器兼容和大图性能仍需按目标环境验证。
+- `test_core.py` 包含烟雾 `main()` 和 unittest 用例；请按项目命令直接执行。烟雾和应用测试仍使用普通 `assert`，不得使用 `python -O`。
 
 ## 20. 发布检查清单
 
-- [ ] `python -m py_compile app.py core.py test_core.py` 通过。
+- [ ] `python -m py_compile app.py core.py excel_export.py test_core.py test_excel.py test_app.py` 通过。
 - [ ] `python test_core.py` 输出 `core tests passed`。
+- [ ] `python -m unittest test_excel -v` 通过。
+- [ ] `python test_app.py` 输出 `app end-to-end tests passed`。
+- [ ] Streamlit `/_stcore/health` 返回 `ok`。
 - [ ] Streamlit 初始页面无异常。
 - [ ] 用普通 JPG、透明 PNG 和自定义 CSV 各走通一次生成流程。
-- [ ] 下载的 PNG、CSV、PDF 和 ZIP 均可打开。
+- [ ] 下载的 PNG、CSV、XLSX、PDF 和 ZIP 均可打开，ZIP 内 XLSX 字节一致。
 - [ ] PDF 分页坐标连续，拼接范围无遗漏或重复。
 - [ ] 用量总和等于网格总数。
 - [ ] `requirements.txt` 与实际导入保持一致。

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from i18n import LocalizedError, Translator
+
 import csv
 import io
 import json
@@ -10,10 +12,12 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 from reportlab.lib.colors import Color
-from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import CIDEncoding, UnicodeCIDFont
 
 
 MAX_PALETTE_COLORS = 512
@@ -98,19 +102,19 @@ def _decode_csv(data: bytes) -> str:
             return data.decode(encoding)
         except UnicodeDecodeError:
             continue
-    raise ValueError("色号表编码无法识别，请另存为 UTF-8 CSV。")
+    raise LocalizedError('色号表编码无法识别，请另存为 UTF-8 CSV。')
 
 
 def parse_palette_csv(data: bytes) -> list[BeadColor]:
     text = _decode_csv(data)
     reader = csv.DictReader(io.StringIO(text))
     if not reader.fieldnames:
-        raise ValueError("CSV 没有表头。")
+        raise LocalizedError('CSV 没有表头。')
     key_map = {str(k).strip().lower(): k for k in reader.fieldnames}
     hex_key = key_map.get("hex") or key_map.get("颜色") or key_map.get("color")
     rgb_keys = [key_map.get(x) for x in ("r", "g", "b")]
     if not hex_key and not all(rgb_keys):
-        raise ValueError("CSV 需要 hex 列，或同时提供 r、g、b 三列。")
+        raise LocalizedError('CSV 需要 hex 列，或同时提供 r、g、b 三列。')
 
     result: list[BeadColor] = []
     for row_no, row in enumerate(reader, 2):
@@ -122,14 +126,14 @@ def parse_palette_csv(data: bytes) -> list[BeadColor]:
                 if len(raw) == 3:
                     raw = "".join(ch * 2 for ch in raw)
                 if len(raw) != 6:
-                    raise ValueError("hex 必须是 6 位颜色值")
+                    raise LocalizedError('hex 必须是 6 位颜色值')
                 r, g, b = tuple(int(raw[i:i + 2], 16) for i in (0, 2, 4))
             else:
                 r, g, b = (int(str(row.get(k, "")).strip()) for k in rgb_keys)
             if not all(0 <= value <= 255 for value in (r, g, b)):
-                raise ValueError("RGB 必须在 0–255 之间")
+                raise LocalizedError('RGB 必须在 0–255 之间')
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"CSV 第 {row_no} 行颜色无效：{exc}") from exc
+            raise LocalizedError('CSV 第 {row_no} 行颜色无效：{exc}', row_no=row_no, exc=exc) from exc
 
         code_key = key_map.get("code") or key_map.get("色号")
         name_key = key_map.get("name") or key_map.get("名称")
@@ -139,20 +143,20 @@ def parse_palette_csv(data: bytes) -> list[BeadColor]:
         brand = str(row.get(brand_key, "") if brand_key else "").strip() or "自定义"
         result.append(BeadColor(code, color_name, r, g, b, brand))
         if len(result) > MAX_PALETTE_COLORS:
-            raise ValueError(f"色号表最多支持 {MAX_PALETTE_COLORS} 个颜色。")
+            raise LocalizedError('色号表最多支持 {MAX_PALETTE_COLORS} 个颜色。', MAX_PALETTE_COLORS=MAX_PALETTE_COLORS)
 
     if not result:
-        raise ValueError("色号表至少需要一个有效颜色。")
+        raise LocalizedError('色号表至少需要一个有效颜色。')
     return result
 
 
-def palette_template_csv() -> bytes:
-    text = (
-        "brand,code,name,hex\n"
-        "我的品牌,A01,白色,#FFFFFF\n"
-        "我的品牌,A02,黑色,#18191C\n"
-        "另一品牌,B01,红色,#CD262B\n"
-    )
+def palette_template_csv(*, language: str = "zh-CN") -> bytes:
+    t = Translator(language)
+    text = "brand,code,name,hex\n" + "\n".join((
+        f'{t("我的品牌")},A01,{t("白色")},#FFFFFF',
+        f'{t("我的品牌")},A02,{t("黑色")},#18191C',
+        f'{t("另一品牌")},B01,{t("红色")},#CD262B',
+    )) + "\n"
     return text.encode("utf-8-sig")
 
 
@@ -161,12 +165,12 @@ def load_image(data: bytes) -> Image.Image:
         image = Image.open(io.BytesIO(data))
         image.seek(0)
         if image.width * image.height > 80_000_000:
-            raise ValueError("图片像素超过 8000 万，请先缩小图片。")
+            raise LocalizedError('图片像素超过 8000 万，请先缩小图片。')
         image.load()
     except ValueError:
         raise
     except Exception as exc:
-        raise ValueError("无法读取这张图片，请使用 JPG、PNG、WEBP、BMP、TIFF 或 GIF。") from exc
+        raise LocalizedError('无法读取这张图片，请使用 JPG、PNG、WEBP、BMP、TIFF 或 GIF。') from exc
     return ImageOps.exif_transpose(image)
 
 
@@ -178,21 +182,46 @@ def prepare_image(
     background: tuple[int, int, int] = (255, 255, 255),
     contrast: float = 1.0,
     saturation: float = 1.0,
+    line_strength: float = 0.0,
+    sharpness: float = 0.0,
 ) -> Image.Image:
     if not (4 <= columns <= 300 and 4 <= rows <= 300):
-        raise ValueError("宽和高需要在 4–300 颗之间。")
+        raise LocalizedError('宽和高需要在 4–300 颗之间。')
+    if not (0 <= line_strength <= 1 and 0 <= sharpness <= 1):
+        raise LocalizedError('细线保留和锐化强度需要在 0–1 之间。')
     rgba = image.convert("RGBA")
     base = Image.new("RGBA", rgba.size, (*background, 255))
     base.alpha_composite(rgba)
     rgb = base.convert("RGB")
     rgb = ImageEnhance.Contrast(rgb).enhance(contrast)
     rgb = ImageEnhance.Color(rgb).enhance(saturation)
-    size = (columns, rows)
-    if fit_mode == "完整留白":
-        return ImageOps.pad(rgb, size, method=Image.Resampling.LANCZOS, color=background)
-    if fit_mode == "拉伸":
-        return rgb.resize(size, Image.Resampling.LANCZOS)
-    return ImageOps.fit(rgb, size, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+    def fit(size: tuple[int, int]) -> Image.Image:
+        if fit_mode == "完整留白":
+            return ImageOps.pad(rgb, size, method=Image.Resampling.LANCZOS, color=background)
+        if fit_mode == "拉伸":
+            return rgb.resize(size, Image.Resampling.LANCZOS)
+        return ImageOps.fit(rgb, size, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+
+    result = fit((columns, rows))
+    if line_strength > 0:
+        # Work at 4 samples per bead, bounded to 1200 x 1200. A closing of
+        # luminance identifies narrow dark strokes rather than every dark area.
+        detail = fit((columns * 4, rows * 4))
+        luminance = detail.convert("L")
+        closed = luminance.filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.MinFilter(5))
+        residual = np.asarray(closed, dtype=np.float32) - np.asarray(luminance, dtype=np.float32)
+        weights = np.clip((residual - 12) / 52, 0, 1).reshape(rows, 4, columns, 4)
+        pixels = np.asarray(detail, dtype=np.float32).reshape(rows, 4, columns, 4, 3)
+        mass = weights.sum(axis=(1, 3))
+        line_rgb = (pixels * weights[..., None]).sum(axis=(1, 3)) / np.maximum(mass[..., None], 1e-6)
+        base_rgb = np.asarray(result, dtype=np.float32)
+        # Do not lighten cells or spread a stroke to a neighbouring bead.
+        darker = (line_rgb @ np.array([.299, .587, .114])) < (base_rgb @ np.array([.299, .587, .114]))
+        alpha = (np.minimum(mass / 16 * 2.5, .85) * line_strength * darker)[..., None]
+        result = Image.fromarray(np.clip(np.rint(base_rgb * (1 - alpha) + line_rgb * alpha), 0, 255).astype(np.uint8))
+    if sharpness > 0:
+        result = result.filter(ImageFilter.UnsharpMask(radius=.6, percent=round(sharpness * 160), threshold=3))
+    return result
 
 
 def extract_palette(image: Image.Image, color_count: int) -> list[BeadColor]:
@@ -232,9 +261,9 @@ def _srgb_to_lab(rgb: np.ndarray) -> np.ndarray:
 
 def map_to_palette(image: Image.Image, palette: Sequence[BeadColor]) -> np.ndarray:
     if not palette:
-        raise ValueError("至少需要一个颜色。")
+        raise LocalizedError('至少需要一个颜色。')
     if len(palette) > MAX_PALETTE_COLORS:
-        raise ValueError(f"色库最多支持 {MAX_PALETTE_COLORS} 个颜色。")
+        raise LocalizedError('色库最多支持 {MAX_PALETTE_COLORS} 个颜色。', MAX_PALETTE_COLORS=MAX_PALETTE_COLORS)
     pixels = np.asarray(image.convert("RGB"), dtype=np.uint8)
     flat_lab = _srgb_to_lab(pixels.reshape(-1, 3))
     palette_rgb = np.array([c.rgb for c in palette], dtype=np.uint8)
@@ -360,13 +389,38 @@ def image_png(image: Image.Image) -> bytes:
     return output.getvalue()
 
 
+def _register_pdf_cjk_font(name: str) -> None:
+    if name in pdfmetrics.getRegisteredFontNames():
+        return
+    font = UnicodeCIDFont(name)
+    if name == "MSung-Light":
+        # ReportLab's default uses the GB CMap for this CNS font. Correct only
+        # our font instance so Traditional Chinese renders in standard readers.
+        font.encodingName = "UniCNS-UCS2-H"
+        font.encoding = CIDEncoding(font.encodingName)
+    pdfmetrics.registerFont(font)
+
+
 def make_pdf(
     indices: np.ndarray,
     palette: Sequence[BeadColor],
     bead_size_mm: float,
     cells_per_page: tuple[int, int] = (25, 35),
     show_codes: bool = True,
+    *,
+    language: str = "en",
 ) -> bytes:
+    if (len(cells_per_page) != 2 or
+            any(isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0
+                for value in cells_per_page)):
+        raise LocalizedError('PDF 每页行列数必须是正整数。')
+    t = Translator(language)
+    cjk_font = {"zh-CN": "STSong-Light", "zh-TW": "MSung-Light", "ja": "HeiseiKakuGo-W5"}.get(language)
+    # CID fonts use the PDF reader's CJK font support; no font or network download.
+    if cjk_font:
+        _register_pdf_cjk_font(cjk_font)
+    regular = cjk_font or "Helvetica"
+    bold = cjk_font or "Helvetica-Bold"
     output = io.BytesIO()
     page_size = A4
     pdf = canvas.Canvas(output, pagesize=page_size, pageCompression=1)
@@ -374,43 +428,48 @@ def make_pdf(
     rows, columns = indices.shape
     usage = usage_rows(indices, palette)
 
-    pdf.setTitle("Bead Pattern")
-    pdf.setFont("Helvetica-Bold", 22)
-    pdf.drawString(42, page_h - 58, "Bead Pattern")
-    pdf.setFont("Helvetica", 11)
+    pdf.setTitle(t("拼豆图"))
+    pdf.setFont(bold, 22)
+    pdf.drawString(42, page_h - 58, t("拼豆图"))
+    pdf.setFont(regular, 11)
     summary = [
-        f"Grid: {columns} x {rows} beads ({columns * rows:,} total)",
-        f"Finished size: {columns * bead_size_mm / 10:.1f} x {rows * bead_size_mm / 10:.1f} cm",
-        f"Used colours: {len(usage)}",
-        "Major grid lines appear every 5 beads.",
+        t("网格：{columns} x {rows} 颗（共 {total:,} 颗）", columns=columns, rows=rows, total=columns * rows),
+        t("成品尺寸：{width:.1f} x {height:.1f} cm", width=columns * bead_size_mm / 10, height=rows * bead_size_mm / 10),
+        t("使用颜色：{count}", count=len(usage)),
+        t("每 5 颗拼豆显示一条粗网格线。"),
     ]
     y = page_h - 88
     for line in summary:
         pdf.drawString(42, y, line)
         y -= 18
     y -= 10
-    pdf.setFont("Helvetica-Bold", 11)
-    pdf.drawString(42, y, "Code")
-    pdf.drawString(104, y, "Name")
+    pdf.setFont(bold, 11)
+    pdf.drawString(42, y, t("色号"))
+    pdf.drawString(104, y, t("名称"))
     pdf.drawString(260, y, "HEX")
-    pdf.drawRightString(390, y, "Count")
-    pdf.drawRightString(470, y, "Percent")
+    pdf.drawRightString(390, y, t("数量"))
+    pdf.drawRightString(470, y, t("占比"))
     y -= 14
-    pdf.setFont("Helvetica", 9)
+    pdf.setFont(regular, 9)
     for item in usage:
         if y < 48:
             pdf.showPage()
             y = page_h - 48
-            pdf.setFont("Helvetica", 9)
+            pdf.setFont(regular, 9)
         rgb = (int(item["r"]), int(item["g"]), int(item["b"]))
         pdf.setFillColor(Color(*(component / 255 for component in rgb)))
         pdf.rect(42, y - 2, 12, 12, fill=1, stroke=1)
         pdf.setFillColorRGB(0.1, 0.1, 0.12)
         pdf.drawString(60, y, str(item["code"])[:12])
-        # Helvetica is intentionally used for portability; non-Latin names are
-        # represented by code and HEX in the printable sheet.
-        ascii_name = str(item["name"]).encode("ascii", "ignore").decode() or "Colour"
-        pdf.drawString(104, y, ascii_name[:24])
+        name = str(item["name"])
+        name_font = regular
+        if not cjk_font and not name.isascii():
+            name_font = "STSong-Light"
+            _register_pdf_cjk_font(name_font)
+        name_size = min(9, 148 / max(1, pdfmetrics.stringWidth(name, name_font, 1)))
+        pdf.setFont(name_font, name_size)
+        pdf.drawString(104, y, name)
+        pdf.setFont(regular, 9)
         pdf.drawString(260, y, str(item["hex"]))
         pdf.drawRightString(390, y, f"{int(item['count']):,}")
         pdf.drawRightString(470, y, f"{float(item['percent']):.2f}%")
@@ -420,6 +479,12 @@ def make_pdf(
     tile_columns, tile_rows = cells_per_page
     col_pages = math.ceil(columns / tile_columns)
     row_pages = math.ceil(rows / tile_rows)
+    margin, label_space, title_space = 30, 24, 42
+    # Every tile shares the same scale, including partial tiles at the edges.
+    cell = min(
+        (page_w - margin * 2 - label_space) / min(columns, tile_columns),
+        (page_h - margin * 2 - title_space - label_space) / min(rows, tile_rows),
+    )
     for page_row in range(row_pages):
         for page_col in range(col_pages):
             x_start = page_col * tile_columns
@@ -427,21 +492,17 @@ def make_pdf(
             x_end = min(columns, x_start + tile_columns)
             y_end = min(rows, y_start + tile_rows)
             visible_cols, visible_rows = x_end - x_start, y_end - y_start
-            margin, label_space, title_space = 30, 24, 42
-            cell = min(
-                (page_w - margin * 2 - label_space) / visible_cols,
-                (page_h - margin * 2 - title_space - label_space) / visible_rows,
-            )
             origin_x = margin + label_space
             origin_y = page_h - margin - title_space - label_space
 
             pdf.setFillColorRGB(0.08, 0.09, 0.11)
-            pdf.setFont("Helvetica-Bold", 11)
+            pdf.setFont(bold, 10)
             pdf.drawString(
                 margin,
                 page_h - margin,
-                f"Tile {page_col + 1}/{col_pages}, {page_row + 1}/{row_pages}  |  "
-                f"Columns {x_start + 1}-{x_end}, Rows {y_start + 1}-{y_end}",
+                t("分页 {col_page}/{col_pages}, {row_page}/{row_pages}  |  列 {x_start}-{x_end}, 行 {y_start}-{y_end}",
+                  col_page=page_col + 1, col_pages=col_pages, row_page=page_row + 1, row_pages=row_pages,
+                  x_start=x_start + 1, x_end=x_end, y_start=y_start + 1, y_end=y_end),
             )
             header_size = max(4, min(7, cell * 0.35))
             pdf.setFont("Helvetica", header_size)
@@ -450,15 +511,14 @@ def make_pdf(
                 pdf.drawCentredString(x, origin_y + 7, str(col + 1))
             for local_row, row in enumerate(range(y_start, y_end)):
                 y_cell = origin_y - (local_row + 1) * cell
+                pdf.setFillColorRGB(0.08, 0.09, 0.11)
+                pdf.setFont("Helvetica", header_size)
                 pdf.drawRightString(origin_x - 5, y_cell + cell * 0.35, str(row + 1))
                 for local_col, col in enumerate(range(x_start, x_end)):
                     bead = palette[int(indices[row, col])]
                     x_cell = origin_x + local_col * cell
                     pdf.setFillColor(Color(*(value / 255 for value in bead.rgb)))
-                    line_width = 0.7 if (col % 5 == 0 or row % 5 == 0) else 0.25
-                    pdf.setLineWidth(line_width)
-                    pdf.setStrokeColorRGB(0.15, 0.16, 0.18)
-                    pdf.rect(x_cell, y_cell, cell, cell, fill=1, stroke=1)
+                    pdf.rect(x_cell, y_cell, cell, cell, fill=1, stroke=0)
                     if show_codes and cell >= 8:
                         text_rgb = _text_color(bead.rgb)
                         pdf.setFillColor(Color(*(value / 255 for value in text_rgb)))
@@ -466,6 +526,17 @@ def make_pdf(
                         pdf.setFont("Helvetica-Bold", font_size)
                         code = bead.code[:6]
                         pdf.drawCentredString(x_cell + cell / 2, y_cell + cell * 0.35, code)
+            pdf.setStrokeColorRGB(0.15, 0.16, 0.18)
+            for local_col in range(visible_cols + 1):
+                major = (x_start + local_col) % 5 == 0 or local_col in (0, visible_cols)
+                pdf.setLineWidth(0.7 if major else 0.25)
+                x = origin_x + local_col * cell
+                pdf.line(x, origin_y, x, origin_y - visible_rows * cell)
+            for local_row in range(visible_rows + 1):
+                major = (y_start + local_row) % 5 == 0 or local_row in (0, visible_rows)
+                pdf.setLineWidth(0.7 if major else 0.25)
+                y = origin_y - local_row * cell
+                pdf.line(origin_x, y, origin_x + visible_cols * cell, y)
             pdf.showPage()
 
     pdf.save()
@@ -480,6 +551,8 @@ def make_bundle(
     palette: Sequence[BeadColor],
     settings: dict[str, object],
     xlsx_bytes: bytes | None = None,
+    *,
+    palette_notice: str | None = None,
 ) -> bytes:
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -489,6 +562,8 @@ def make_bundle(
         archive.writestr("printable_pattern.pdf", pdf_bytes)
         if xlsx_bytes is not None:
             archive.writestr("bead_pattern.xlsx", xlsx_bytes)
+        if palette_notice is not None:
+            archive.writestr("palette_source.txt", palette_notice.encode("utf-8"))
         archive.writestr(
             "palette_used.csv",
             usage_csv([{

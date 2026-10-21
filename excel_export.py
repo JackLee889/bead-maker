@@ -1,6 +1,8 @@
 """Application-side Excel export; one converted bead is one editable cell."""
 from __future__ import annotations
 
+from i18n import LocalizedError, Translator
+
 import io
 from typing import TYPE_CHECKING, Sequence
 
@@ -17,7 +19,7 @@ if TYPE_CHECKING:
 def _literal(cell, value: str) -> None:
     """Preserve leading zeros and never interpret imported labels as formulas."""
     if len(value) > 32767 or ILLEGAL_CHARACTERS_RE.search(value):
-        raise ValueError("色号、品牌或名称含 Excel 不支持的控制字符，或长度超过 32767。")
+        raise LocalizedError('色号、品牌或名称含 Excel 不支持的控制字符，或长度超过 32767。')
     cell.value = value
     cell.data_type = "s"
 
@@ -26,6 +28,8 @@ def make_xlsx(
     indices: np.ndarray,
     palette: Sequence[BeadColor],
     show_codes: bool = True,
+    *,
+    language: str = "zh-CN",
 ) -> bytes:
     """Return XLSX bytes from the unscaled (rows, columns) palette-index array.
 
@@ -33,25 +37,26 @@ def make_xlsx(
     the grid. The legend is a generation-time snapshot, not a live inventory.
     """
     from core import _text_color, usage_rows
+    t = Translator(language)
 
     indices = np.asarray(indices)
     if indices.ndim != 2 or not indices.size:
-        raise ValueError("Excel 导出需要非空二维像素矩阵。")
+        raise LocalizedError('Excel 导出需要非空二维像素矩阵。')
     rows, columns = indices.shape
     if rows > 300 or columns > 300:
-        raise ValueError("Excel 导出最多支持 300 × 300 格。")
+        raise LocalizedError('Excel 导出最多支持 300 × 300 格。')
     if not np.issubdtype(indices.dtype, np.integer):
-        raise ValueError("像素矩阵必须包含整数色库索引。")
+        raise LocalizedError('像素矩阵必须包含整数色库索引。')
     if not palette or indices.min() < 0 or indices.max() >= len(palette):
-        raise ValueError("像素矩阵含无效色库索引。")
+        raise LocalizedError('像素矩阵含无效色库索引。')
     for color in palette:
         for label in (color.code, color.brand, color.name):
             if len(label) > 32767 or ILLEGAL_CHARACTERS_RE.search(label):
-                raise ValueError("色号、品牌或名称含 Excel 不支持的控制字符，或长度超过 32767。")
+                raise LocalizedError('色号、品牌或名称含 Excel 不支持的控制字符，或长度超过 32767。')
 
     book = Workbook()
     grid = book.active
-    grid.title = "拼豆图"
+    grid.title = t("拼豆图")
     grid.sheet_view.showGridLines = False
     grid.sheet_view.zoomScale = 70
     # Calibri 11: width ~= (pixels - 5) / 7; points = pixels * 0.75.
@@ -88,8 +93,8 @@ def make_xlsx(
     grid.page_setup.scale = 100
     grid.print_options.headings = True
 
-    legend = book.create_sheet("色号统计")
-    legend.append(["色块", "品牌", "色号", "名称", "HEX", "数量（生成时）"])
+    legend = book.create_sheet(t("色号统计"))
+    legend.append([t(label) for label in ("色块", "品牌", "色号", "名称", "HEX", "数量（生成时）")])
     usage = usage_rows(indices, palette)
     for row, item in enumerate(usage, 2):
         legend.cell(row, 1).fill = PatternFill("solid", fgColor=str(item["hex"])[1:])
@@ -97,7 +102,7 @@ def make_xlsx(
             _literal(legend.cell(row, column), str(item[key]))
         legend.cell(row, 6, int(item["count"])).number_format = "#,##0"
     total_row = len(usage) + 2
-    legend.cell(total_row, 5, "合计")
+    legend.cell(total_row, 5, t("合计"))
     legend.cell(total_row, 6, f"=SUM(F2:F{total_row - 1})").number_format = "#,##0"
     for cell in legend[1]:
         cell.fill = PatternFill("solid", fgColor="243746")
